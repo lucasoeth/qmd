@@ -7,12 +7,15 @@
  * rerank functions first to trigger model downloads.
  */
 
-import { describe, test, expect, beforeAll, afterAll, vi } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
 import {
   LlamaCpp,
+  OpenAICompatibleLLM,
+  createLLM,
   getDefaultLlamaCpp,
   disposeDefaultLlamaCpp,
   resolveLlamaGpuMode,
+  resolveLlmProvider,
   setNodeLlamaCppModuleForTest,
   withNativeStdoutRedirectedToStderr,
   resolveParallelismOverride,
@@ -27,6 +30,222 @@ import {
   type RerankDocument,
   type ILLMSession,
 } from "../src/llm.js";
+
+describe("OpenAI-compatible backend", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("auto-selects the OpenAI-compatible backend when a base URL is configured", () => {
+    expect(resolveLlmProvider(undefined, "http://127.0.0.1:8080/v1")).toBe("openai-compatible");
+    expect(createLLM({ baseUrl: "http://127.0.0.1:8080/v1" })).toBeInstanceOf(OpenAICompatibleLLM);
+  });
+
+  test("explicit provider overrides the base-URL heuristic", () => {
+    expect(resolveLlmProvider("llama-cpp", "http://127.0.0.1:8080/v1")).toBe("llama-cpp");
+    expect(resolveLlmProvider("openai", undefined)).toBe("openai-compatible");
+  });
+
+  test("embedBatch maps embeddings by response index", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [
+          { index: 1, embedding: [0.2, 0.3] },
+          { index: 0, embedding: [0.1] },
+        ],
+      }),
+    } as any);
+
+    const llm = new OpenAICompatibleLLM({
+      baseUrl: "https://openrouter.ai/api/v1",
+      apiKey: "test-key",
+      embedModel: "google/gemini-embedding-2",
+    });
+
+    const results = await llm.embedBatch(["first", "second"]);
+
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "https://openrouter.ai/api/v1/embeddings",
+      expect.objectContaining({ method: "POST" })
+    );
+    const headers = (fetchSpy.mock.calls[0]![1] as RequestInit).headers as Record<string, string>;
+    expect(headers.authorization).toBe("Bearer test-key");
+    expect(results).toEqual([
+      { embedding: [0.1], model: "google/gemini-embedding-2" },
+      { embedding: [0.2, 0.3], model: "google/gemini-embedding-2" },
+    ]);
+  });
+
+  test("embedBatch falls back to array position when index is omitted", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [{ embedding: [0.1] }, { embedding: [0.2] }],
+      }),
+    } as any);
+
+    const llm = new OpenAICompatibleLLM({ baseUrl: "http://x/v1", embedModel: "m" });
+    const results = await llm.embedBatch(["a", "b"]);
+    expect(results).toEqual([
+      { embedding: [0.1], model: "m" },
+      { embedding: [0.2], model: "m" },
+    ]);
+  });
+
+  test("embedBatch returns nulls on transport failure", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status: 401,
+      statusText: "Unauthorized",
+      text: async () => "no key",
+    } as any);
+
+    const llm = new OpenAICompatibleLLM({ baseUrl: "http://x/v1", embedModel: "m" });
+    const results = await llm.embedBatch(["a", "b"]);
+    expect(results).toEqual([null, null]);
+  });
+
+  test("does not double the /v1 path segment when baseUrl already ends in /v1", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ index: 0, embedding: [0.1] }] }),
+    } as any);
+
+    const llm = new OpenAICompatibleLLM({ baseUrl: "https://openrouter.ai/api/v1/", embedModel: "m" });
+    await llm.embedBatch(["a"]);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      "https://openrouter.ai/api/v1/embeddings",
+      expect.anything()
+    );
+  });
+
+  test("expandQuery parses newline-prefixed completions", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [
+          {
+            message: {
+              content: "lex: weaver docs\nvec: weaver memory system\nhyde: Information about weaver docs",
+            },
+          },
+        ],
+      }),
+    } as any);
+
+    const llm = new OpenAICompatibleLLM({
+      baseUrl: "http://127.0.0.1:8080/v1",
+      generateModel: "qmd-query",
+    });
+
+    const results = await llm.expandQuery("weaver docs");
+
+    expect(results).toEqual([
+      { type: "lex", text: "weaver docs" },
+      { type: "vec", text: "weaver memory system" },
+      { type: "hyde", text: "Information about weaver docs" },
+    ]);
+  });
+
+  test("rerank maps remote indices back to source files", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        results: [
+          { index: 1, relevance_score: 0.9 },
+          { index: 0, relevance_score: 0.4 },
+        ],
+      }),
+    } as any);
+
+    const llm = new OpenAICompatibleLLM({
+      baseUrl: "http://127.0.0.1:8080/v1",
+      rerankModel: "qmd-rerank",
+    });
+
+    const result = await llm.rerank("capital", [
+      { file: "a.md", text: "alpha" },
+      { file: "b.md", text: "beta" },
+    ]);
+
+    expect(result).toEqual({
+      model: "qmd-rerank",
+      results: [
+        { file: "b.md", score: 0.9, index: 1 },
+        { file: "a.md", score: 0.4, index: 0 },
+      ],
+    });
+  });
+
+  test("recovers from oversized rerank requests by splitting and truncating", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String((init as RequestInit)?.body ?? "{}"));
+      const documents = Array.isArray(body.documents) ? body.documents : [];
+      const tooManyDocs = documents.length > 1;
+      const oversizedSingle = documents.some((doc: string) => typeof doc === "string" && doc.length > 64);
+
+      if (tooManyDocs || oversizedSingle) {
+        return {
+          ok: false,
+          status: 500,
+          statusText: "Internal Server Error",
+          text: async () => JSON.stringify({
+            error: { code: 500, message: "input is too large to process", type: "server_error" },
+          }),
+        } as any;
+      }
+
+      return {
+        ok: true,
+        json: async () => ({
+          results: documents.map((_: unknown, index: number) => ({
+            index,
+            relevance_score: 1 - index * 0.1,
+          })),
+        }),
+      } as any;
+    });
+
+    const llm = new OpenAICompatibleLLM({
+      baseUrl: "http://127.0.0.1:8080/v1",
+      rerankModel: "qmd-rerank",
+    });
+
+    const documents = [
+      { file: "a.md", text: "a".repeat(6000) },
+      { file: "b.md", text: "b".repeat(6000) },
+      { file: "c.md", text: "c".repeat(6000) },
+    ];
+
+    const result = await llm.rerank("capital", documents);
+
+    expect(fetchSpy).toHaveBeenCalled();
+    const requestBodies = fetchSpy.mock.calls.map(([, init]) => JSON.parse(String((init as RequestInit)?.body ?? "{}")));
+    expect(requestBodies[0]?.documents.length).toBe(documents.length);
+    expect(requestBodies.some((body) => body.documents.length === 1)).toBe(true);
+    expect(requestBodies.some((body) => body.documents[0]?.length < documents[0]!.text.length)).toBe(true);
+    expect(result.results).toHaveLength(documents.length);
+  });
+
+  test("getDeviceInfo reports the remote backend and endpoint", async () => {
+    const llm = new OpenAICompatibleLLM({ baseUrl: "https://openrouter.ai/api/v1" });
+    const info = await llm.getDeviceInfo();
+    expect(info.backend).toBe("openai-compatible");
+    expect(info.endpoint).toBe("https://openrouter.ai/api/v1");
+    expect(info.gpu).toBe(false);
+  });
+
+  test("constructor requires a base URL", () => {
+    const prev = process.env.QMD_OPENAI_BASE_URL;
+    delete process.env.QMD_OPENAI_BASE_URL;
+    try {
+      expect(() => new OpenAICompatibleLLM({})).toThrow(/base ?URL|baseUrl/i);
+    } finally {
+      if (prev !== undefined) process.env.QMD_OPENAI_BASE_URL = prev;
+    }
+  });
+});
 
 describe("model name resolution", () => {
   function withModelEnv(env: Record<string, string | undefined>, fn: () => void): void {
@@ -557,6 +776,7 @@ describe("LlamaCpp.getDeviceInfo", () => {
       gpuDevices: ["Apple GPU"],
       vram: { total: 1024, used: 256, free: 768 },
       cpuCores: 8,
+      backend: "llama-cpp",
     });
   });
 });

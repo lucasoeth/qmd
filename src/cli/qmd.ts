@@ -80,7 +80,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, createLLM, getDefaultLLM, setDefaultLLM, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -133,10 +133,13 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
+      setDefaultLLM(createLLM({
         embedModel: activeModels.embed,
         generateModel: activeModels.generate,
         rerankModel: activeModels.rerank,
+        provider: config.llm?.provider,
+        baseUrl: config.llm?.baseUrl,
+        apiKey: config.llm?.apiKey,
       }));
     } catch {
       // Config may not exist yet — that's fine, DB works without it
@@ -3761,9 +3764,15 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   }
 
   try {
-    const device = await getDefaultLlamaCpp().getDeviceInfo({ allowBuild: false });
+    const device = await getDefaultLLM().getDeviceInfo?.({ allowBuild: false });
     if (process.stdout.isTTY) {
       process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
+    }
+    if (!device || device.backend === "openai-compatible") {
+      doctorCheck("device probe", true, device?.endpoint
+        ? `remote OpenAI-compatible backend (${device.endpoint}); no local device to probe.`
+        : "backend does not expose a local device probe (remote/OpenAI-compatible).");
+      return;
     }
     if (device.gpu) {
       const gpuLabel = device.gpu === "metal" && process.platform === "darwin"
